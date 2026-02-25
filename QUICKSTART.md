@@ -77,6 +77,8 @@ claudeloop                # execute
 ```bash
 claudeloop --version           # print installed version
 claudeloop --plan my-plan.md   # use a specific plan file
+claudeloop --verify-command <cmd>   # Run an external verification command after each successful phase
+                                    # (e.g. --verify-command "npx gate claude bundle pr")
 claudeloop --reset             # reset progress and start over
 claudeloop --continue          # resume after Ctrl+C interrupt
 claudeloop --phase 3           # start from a specific phase

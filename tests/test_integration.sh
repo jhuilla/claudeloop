@@ -254,6 +254,64 @@ PROGRESS
   [ -s "$TEST_DIR/.claudeloop/logs/phase-2.log" ]
 }
 
+@test "verification: success hook runs after each phase and preserves completed status" {
+  cat > "$TEST_DIR/bin/verify_ok" << EOF
+#!/bin/sh
+count_file="$TEST_DIR/verify_call_count"
+count=\$(cat "\$count_file" 2>/dev/null || echo 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" > "\$count_file"
+exit 0
+EOF
+  chmod +x "$TEST_DIR/bin/verify_ok"
+
+  _cl --plan PLAN.md --verify-command "$TEST_DIR/bin/verify_ok"
+  [ "$status" -eq 0 ]
+  # Verification runs once per executed phase (2 phases in default plan)
+  [ -f "$TEST_DIR/verify_call_count" ]
+  [ "$(cat "$TEST_DIR/verify_call_count")" -eq 2 ]
+  # Both phases remain completed
+  [ "$(_completed_count)" -eq 2 ]
+}
+
+@test "verification: exit 1 marks phase as failed and exits non-zero" {
+  cat > "$TEST_DIR/bin/verify_fail" << EOF
+#!/bin/sh
+exit 1
+EOF
+  chmod +x "$TEST_DIR/bin/verify_fail"
+
+  _cl --plan PLAN.md --max-retries 1 --verify-command "$TEST_DIR/bin/verify_fail"
+  [ "$status" -ne 0 ]
+  # At least one phase must be marked failed in PROGRESS.md
+  grep -q "Status: failed" "$TEST_DIR/.claudeloop/PROGRESS.md"
+}
+
+@test "verification: exit 2 causes claudeloop to exit 2 without retries" {
+  cat > "$TEST_DIR/bin/verify_infra" << EOF
+#!/bin/sh
+exit 2
+EOF
+  chmod +x "$TEST_DIR/bin/verify_infra"
+
+  run sh -c "cd '$TEST_DIR' && '$CLAUDELOOP' --plan PLAN.md --max-retries 3 --verify-command '$TEST_DIR/bin/verify_infra'"
+  [ "$status" -eq 2 ]
+}
+
+@test "verification: hook not executed during --dry-run" {
+  cat > "$TEST_DIR/bin/verify_marker" << EOF
+#!/bin/sh
+echo "should-not-run" >> "$TEST_DIR/verify_marker_log"
+exit 0
+EOF
+  chmod +x "$TEST_DIR/bin/verify_marker"
+
+  run sh -c "cd '$TEST_DIR' && '$CLAUDELOOP' --plan PLAN.md --verify-command '$TEST_DIR/bin/verify_marker' --dry-run"
+  [ "$status" -eq 0 ]
+  # Hook must not have been invoked
+  [ ! -f "$TEST_DIR/verify_marker_log" ]
+}
+
 # =============================================================================
 # parse_args tests (via subprocess)
 # =============================================================================
@@ -311,6 +369,16 @@ PROGRESS
 
 @test "parse_args: --phase-prompt without value exits non-zero" {
   run sh -c "cd '$TEST_DIR' && '$CLAUDELOOP' --phase-prompt 2>&1"
+  [ "$status" -ne 0 ]
+}
+
+@test "parse_args: --verify-command flag is accepted with --dry-run" {
+  run sh -c "cd '$TEST_DIR' && '$CLAUDELOOP' --plan PLAN.md --verify-command 'echo ok' --dry-run"
+  [ "$status" -eq 0 ]
+}
+
+@test "parse_args: --verify-command without value exits non-zero" {
+  run sh -c "cd '$TEST_DIR' && '$CLAUDELOOP' --verify-command 2>&1"
   [ "$status" -ne 0 ]
 }
 

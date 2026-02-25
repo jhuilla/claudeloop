@@ -78,6 +78,8 @@ See `examples/PLAN.md.example` for a complete example.
 --max-phase-time <s> Kill claude after N seconds per phase, then retry (0=disabled, default 1800)
 --simple             Plain output (no colors)
 --dangerously-skip-permissions  Bypass claude permission prompts (use with caution)
+--verify-command <cmd>  Run an external verification command after each successful phase
+                        (e.g. --verify-command "npx gate claude bundle pr")
 --phase-prompt <file>  Custom prompt template for phase execution
 --monitor            Watch live output of a running claudeloop instance
 --version, -V        Print version and exit
@@ -106,6 +108,7 @@ If you pass CLI arguments on a subsequent run, only the explicitly set keys are 
 | `PHASE_PROMPT_FILE` | `--phase-prompt` | _(empty)_ |
 | `QUOTA_RETRY_INTERVAL` | `--quota-retry-interval` | `900` |
 | `MAX_PHASE_TIME` | `--max-phase-time` | `0` |
+| `VERIFY_COMMAND` | `--verify-command` | `""` (disabled) |
 
 Example `.claudeloop/.claudeloop.conf`:
 
@@ -155,9 +158,10 @@ PHASE_PROMPT_FILE=prompts/my-template.md
 1. Parse `PLAN.md` — extract phases and dependencies
 2. Find the next runnable phase (dependencies met, not yet completed)
 3. Spawn a fresh `claude` CLI instance with the phase description
-4. Save result to `PROGRESS.md`
-5. On failure: retry with exponential backoff (up to `--max-retries`)
-6. Repeat until all phases complete
+4. Optionally run an external verification hook (e.g. `gate claude bundle <phase>`) after each successful phase
+5. Save result to `PROGRESS.md`
+6. On failure: retry with exponential backoff (up to `--max-retries`)
+7. Repeat until all phases (and, if configured, verification hooks) complete
 
 Press **Ctrl+C** at any time — progress is saved and you can resume with `--continue`.
 

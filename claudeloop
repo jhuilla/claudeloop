@@ -22,6 +22,7 @@ _CL_QUOTA_RETRY_INTERVAL="${QUOTA_RETRY_INTERVAL:-}"
 _CL_SKIP_PERMISSIONS="${SKIP_PERMISSIONS:-}"
 _CL_STREAM_TRUNCATE_LEN="${STREAM_TRUNCATE_LEN:-}"
 _CL_MAX_PHASE_TIME="${MAX_PHASE_TIME:-}"
+_CL_VERIFY_COMMAND="${VERIFY_COMMAND:-}"
 
 # Source libraries
 . "$SCRIPT_DIR/lib/parser.sh"
@@ -55,11 +56,12 @@ MONITOR_MODE=false
 MAX_PHASE_TIME=0             # kill claude after N seconds per phase (0=disabled, default)
 CURRENT_PIPELINE_PID=""     # PID of running claude pipeline (last in pipeline), for interrupt cleanup
 CURRENT_PIPELINE_PGID=""    # PGID of running claude pipeline (first in pipeline), for group kill
+VERIFY_COMMAND=""           # optional external verification hook (e.g. gate) after each successful phase
 
 # Sentinels: set to 1 when the corresponding arg is explicitly passed via CLI
 _CLI_PLAN_FILE="" _CLI_PROGRESS_FILE="" _CLI_MAX_RETRIES="" _CLI_SIMPLE_MODE=""
 _CLI_PHASE_PROMPT_FILE="" _CLI_QUOTA_RETRY_INTERVAL="" _CLI_SKIP_PERMISSIONS=""
-_CLI_MAX_PHASE_TIME=""
+_CLI_MAX_PHASE_TIME="" _CLI_VERIFY_COMMAND=""
 
 # Set to 1 in tests to bypass [ -t 0 ] TTY check in run_setup_wizard
 _WIZARD_FORCE="${_WIZARD_FORCE:-}"
@@ -101,6 +103,7 @@ load_config() {
       STREAM_TRUNCATE_LEN)    STREAM_TRUNCATE_LEN="$value" ;;
       HOOKS_ENABLED)          HOOKS_ENABLED="$value" ;;
       MAX_PHASE_TIME)         MAX_PHASE_TIME="$value" ;;
+      VERIFY_COMMAND)         VERIFY_COMMAND="$value" ;;
     esac
   done < "$conf_file"
 }
@@ -140,6 +143,7 @@ write_config() {
       printf 'MAX_DELAY=%s\n'        "$MAX_DELAY"
       printf 'STREAM_TRUNCATE_LEN=%s\n' "$STREAM_TRUNCATE_LEN"
       printf 'MAX_PHASE_TIME=%s\n'      "$MAX_PHASE_TIME"
+      printf 'VERIFY_COMMAND=%s\n'      "$VERIFY_COMMAND"
       [ -n "$PHASE_PROMPT_FILE" ]    && printf 'PHASE_PROMPT_FILE=%s\n'    "$PHASE_PROMPT_FILE"
       [ -n "$QUOTA_RETRY_INTERVAL" ] && printf 'QUOTA_RETRY_INTERVAL=%s\n' "$QUOTA_RETRY_INTERVAL"
     } > "$conf_file"
@@ -156,6 +160,7 @@ write_config() {
   [ -n "$_CLI_QUOTA_RETRY_INTERVAL" ] && update_conf_key "$conf_file" QUOTA_RETRY_INTERVAL "$QUOTA_RETRY_INTERVAL"
   [ -n "$_CLI_SKIP_PERMISSIONS" ]     && update_conf_key "$conf_file" SKIP_PERMISSIONS "$SKIP_PERMISSIONS"
   [ -n "$_CLI_MAX_PHASE_TIME" ]       && update_conf_key "$conf_file" MAX_PHASE_TIME "$MAX_PHASE_TIME"
+  [ -n "$_CLI_VERIFY_COMMAND" ]       && update_conf_key "$conf_file" VERIFY_COMMAND "$VERIFY_COMMAND"
   return 0
 }
 
@@ -437,6 +442,8 @@ Options:
                          (enabled automatically when running inside Claude Code)
   --dangerously-skip-permissions  Pass --dangerously-skip-permissions to claude
   --monitor              Follow live output of a running claudeloop instance
+  --verify-command <cmd> Run an external verification command after each successful phase
+                         (e.g. --verify-command "npx gate claude bundle pr")
   --version, -V          Print version and exit
   --help                 Show this help message
 
@@ -531,6 +538,11 @@ parse_args() {
       --monitor)
         MONITOR_MODE=true
         shift
+        ;;
+      --verify-command)
+        if [ $# -lt 2 ]; then echo "Error: --verify-command requires an argument" >&2; exit 1; fi
+        VERIFY_COMMAND="$2"; _CLI_VERIFY_COMMAND=1
+        shift 2
         ;;
       --help|-h)
         usage
@@ -689,6 +701,56 @@ inject_heartbeats() {
       printf '{"type":"heartbeat"}\n'
     fi
   done
+}
+
+# Run optional external verification command after a successful phase.
+# Returns:
+#   0 - verification passed or disabled/dry-run
+#   1 - verification/gate failure (exit 1)
+#   2 - verification config/runtime error (exit 2)
+#   3 - unexpected exit code from verification command
+run_verification_command() {
+  local phase_num="$1"
+
+  # No-op in dry-run mode
+  if $DRY_RUN; then
+    return 0
+  fi
+
+  # No verification configured
+  if [ -z "$VERIFY_COMMAND" ]; then
+    return 0
+  fi
+
+  local _pv title rc
+  _pv=$(phase_to_var "$phase_num")
+  title=$(eval "echo \"\$PHASE_TITLE_${_pv}\"")
+
+  log_verbose "run_verification_command: phase=$phase_num title=$title cmd=$VERIFY_COMMAND"
+
+  CLAUDELOOP_PHASE_NUM="$phase_num" \
+  CLAUDELOOP_PHASE_TITLE="$title" \
+  sh -c "$VERIFY_COMMAND"
+  rc=$?
+
+  case "$rc" in
+    0)
+      print_success "Verification passed for Phase $phase_num"
+      return 0
+      ;;
+    1)
+      print_error "Verification command failed for Phase $phase_num (exit 1)"
+      return 1
+      ;;
+    2)
+      print_error "Verification command encountered a config/runtime error for Phase $phase_num (exit 2)"
+      return 2
+      ;;
+    *)
+      print_error "Verification command exited with unexpected code $rc for Phase $phase_num"
+      return 3
+      ;;
+  esac
 }
 
 # Execute a single phase
@@ -909,19 +971,69 @@ You MUST still complete every subtask listed in the phase description — do not
       return 1
     fi
     log_verbose "execute_phase: phase $phase_num succeeded"
-    print_success "Phase $phase_num completed successfully"
-    update_phase_status "$phase_num" "completed"
-    write_progress "$PROGRESS_FILE" "$PLAN_FILE"
-    CURRENT_PHASE=""
-    return 0
+
+    # Optional external verification hook (e.g. gate) after successful phase
+    local _verify_rc=0
+    run_verification_command "$phase_num" || _verify_rc=$?
+
+    case "$_verify_rc" in
+      0)
+        print_success "Phase $phase_num completed successfully"
+        update_phase_status "$phase_num" "completed"
+        write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+        CURRENT_PHASE=""
+        return 0
+        ;;
+      1|3)
+        print_error "Phase $phase_num: verification failed"
+        update_phase_status "$phase_num" "failed"
+        write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+        CURRENT_PHASE=""
+        return 1
+        ;;
+      2)
+        print_error "Phase $phase_num: verification encountered an infrastructure/config error (exit 2)"
+        # Leave status as in_progress for this attempt; read_progress will
+        # normalize stale in_progress back to pending on the next run.
+        write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+        CURRENT_PHASE=""
+        return 2
+        ;;
+    esac
   else
     if has_successful_session "$log_file"; then
       log_verbose "execute_phase: phase $phase_num exited non-zero ($claude_exit) but successful session detected"
-      print_warning "Phase $phase_num: Claude exited with code $claude_exit but a successful session was detected — treating as completed."
-      update_phase_status "$phase_num" "completed"
-      write_progress "$PROGRESS_FILE" "$PLAN_FILE"
-      CURRENT_PHASE=""
-      return 0
+      if [ -n "$VERIFY_COMMAND" ]; then
+        print_warning "Phase $phase_num: Claude exited with code $claude_exit but a successful session was detected — treating as successful before verification."
+      else
+        print_warning "Phase $phase_num: Claude exited with code $claude_exit but a successful session was detected — treating as completed."
+      fi
+
+      # Optional external verification hook after successful session
+      local _verify_rc2=0
+      run_verification_command "$phase_num" || _verify_rc2=$?
+
+      case "$_verify_rc2" in
+        0)
+          update_phase_status "$phase_num" "completed"
+          write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+          CURRENT_PHASE=""
+          return 0
+          ;;
+        1|3)
+          print_error "Phase $phase_num: verification failed"
+          update_phase_status "$phase_num" "failed"
+          write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+          CURRENT_PHASE=""
+          return 1
+          ;;
+        2)
+          print_error "Phase $phase_num: verification encountered an infrastructure/config error (exit 2)"
+          write_progress "$PROGRESS_FILE" "$PLAN_FILE"
+          CURRENT_PHASE=""
+          return 2
+          ;;
+      esac
     fi
     log_verbose "execute_phase: phase $phase_num failed"
     print_error "Phase $phase_num failed"
@@ -983,6 +1095,12 @@ main_loop() {
       # Success - continue to next phase
       continue
     else
+      local phase_rc=$?
+      if [ "$phase_rc" -eq 2 ]; then
+        print_error "Verification hook failed with infrastructure/config error (exit 2) for Phase $next_phase."
+        print_error "Fix the external verification command (e.g. Gate) or its configuration, then rerun claudeloop."
+        return 2
+      fi
       local _log_file
       _log_file=".claudeloop/logs/phase-${next_phase}.log"
       local _npv
@@ -1142,6 +1260,7 @@ main() {
   [ -n "$_CL_SKIP_PERMISSIONS" ]        && SKIP_PERMISSIONS="$_CL_SKIP_PERMISSIONS"
   [ -n "$_CL_STREAM_TRUNCATE_LEN" ]     && STREAM_TRUNCATE_LEN="$_CL_STREAM_TRUNCATE_LEN"
   [ -n "$_CL_MAX_PHASE_TIME" ]          && MAX_PHASE_TIME="$_CL_MAX_PHASE_TIME"
+  [ -n "$_CL_VERIFY_COMMAND" ]          && VERIFY_COMMAND="$_CL_VERIFY_COMMAND"
 
   # Parse CLI arguments (CLI takes priority over everything)
   parse_args "$@"

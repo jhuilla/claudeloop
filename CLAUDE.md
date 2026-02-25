@@ -86,7 +86,7 @@ done
 
 ```
 main → parse_plan → init_progress → main_loop
-  find_next_phase → execute_phase → update_phase_status → write_progress
+  find_next_phase → execute_phase → (optional verify_command) → update_phase_status → write_progress
   on failure:  should_retry_phase → calculate_backoff → sleep → retry
   on Ctrl+C:   handle_interrupt → write_progress → save_state → exit 130
   --monitor:   run_monitor → tail -f .claudeloop/live.log

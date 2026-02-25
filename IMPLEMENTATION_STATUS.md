@@ -68,12 +68,12 @@
 - ✅ **UI Tests** (`tests/test_ui.sh`) - 24 tests
 - ✅ **Killswitch Tests** (`tests/test_killswitch.sh`) - 4 tests
 - ✅ **Prompt Tests** (`tests/test_prompt.sh`) - 13 tests
-- ✅ **Integration Tests** (`tests/test_integration.sh`) - 17 tests
+- ✅ **Integration Tests** (`tests/test_integration.sh`) - 70 tests
   - Happy path, single retry, exhaust retries, dependency blocking
   - `--reset`, `--phase N`, resume from checkpoint
   - Lock file conflict + stale lock cleanup
   - Log file creation and non-empty
-  - `parse_args` and `create_lock`/`remove_lock` coverage
+  - `parse_args`, verification hook (`--verify-command`), and `create_lock`/`remove_lock` coverage
 - ✅ **Test Runner** - `tests/run_all_tests.sh`
 
 ## ⚠️ Not Implemented (Future Work)
@@ -108,7 +108,7 @@
 ✅ `--verbose` flag for debug output
 ✅ `.claudeloop/.claudeloop.conf` config file support
 ✅ Log rotation (max 500 lines per phase log)
-✅ Integration tests (17 tests covering end-to-end scenarios)
+✅ Integration tests (70 tests covering end-to-end scenarios)
 ✅ Comprehensive test coverage for all libraries
 ✅ Comprehensive documentation
 
