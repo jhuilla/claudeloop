@@ -312,6 +312,20 @@ EOF
   [ ! -f "$TEST_DIR/verify_marker_log" ]
 }
 
+@test "verification: hook stdout is captured into phase logs" {
+  cat > "$TEST_DIR/bin/verify_json" << 'EOF'
+#!/bin/sh
+printf '{"phase":"%s","marker":"VERIFY_JSON"}\n' "${CLAUDELOOP_PHASE_NUM:-unknown}"
+exit 0
+EOF
+  chmod +x "$TEST_DIR/bin/verify_json"
+
+  _cl --plan PLAN.md --verify-command "$TEST_DIR/bin/verify_json"
+  [ "$status" -eq 0 ]
+  grep -q "VERIFY_JSON" "$TEST_DIR/.claudeloop/logs/phase-1.log"
+  grep -q "VERIFY_JSON" "$TEST_DIR/.claudeloop/logs/phase-2.log"
+}
+
 # =============================================================================
 # parse_args tests (via subprocess)
 # =============================================================================
@@ -996,6 +1010,52 @@ EOF
   [ "$status" -eq 0 ]
   # No attempt-1 archive: phase succeeded on first try
   [ ! -f "$TEST_DIR/.claudeloop/logs/phase-1.attempt-1.log" ]
+}
+
+@test "retry context: verification output injected into retry prompt" {
+  # Override claude stub to capture prompts into claude_prompt_N.txt
+  cat > "$TEST_DIR/bin/claude" << EOF
+#!/bin/sh
+count_file="$TEST_DIR/claude_call_count"
+count=\$(cat "\$count_file" 2>/dev/null || echo 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" > "\$count_file"
+prompt_file="$TEST_DIR/claude_prompt_\${count}.txt"
+cat > "\$prompt_file"
+printf 'stub output for call %s\n' "\$count"
+exit 0
+EOF
+  chmod +x "$TEST_DIR/bin/claude"
+
+  # Verification command: fails once with a distinctive marker, then succeeds
+  cat > "$TEST_DIR/bin/verify_fail_once" << EOF
+#!/bin/sh
+count_file="$TEST_DIR/verify_fail_once_count"
+count=\$(cat "\$count_file" 2>/dev/null || echo 0)
+count=\$((count + 1))
+printf '%s\n' "\$count" > "\$count_file"
+if [ "\$count" -eq 1 ]; then
+  printf 'VERIFICATION_MARKER_XYZ123 first attempt\n'
+  exit 1
+fi
+printf 'VERIFICATION_MARKER_XYZ123 second attempt\n'
+exit 0
+EOF
+  chmod +x "$TEST_DIR/bin/verify_fail_once"
+
+  _cl --plan PLAN.md --max-retries 2 --verify-command "$TEST_DIR/bin/verify_fail_once"
+  [ "$status" -eq 0 ]
+
+  # Second attempt prompt must contain both the verification section heading and the marker
+  second_prompt="$TEST_DIR/claude_prompt_2.txt"
+  [ -f "$second_prompt" ]
+  grep -q "Previous Attempt Verification Output" "$second_prompt"
+  grep -q "VERIFICATION_MARKER_XYZ123" "$second_prompt"
+
+  # First attempt prompt must not mention the verification output section
+  first_prompt="$TEST_DIR/claude_prompt_1.txt"
+  [ -f "$first_prompt" ]
+  ! grep -q "Previous Attempt Verification Output" "$first_prompt"
 }
 
 # =============================================================================

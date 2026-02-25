@@ -50,6 +50,7 @@ SIMPLE_MODE=false
 VERBOSE_MODE=false
 SKIP_PERMISSIONS=false
 STREAM_TRUNCATE_LEN=300
+VERIFY_CONTEXT_TAIL_LINES=40   # lines of verification log to inject into retry prompt
 HOOKS_ENABLED=false
 LIVE_LOG=""
 MONITOR_MODE=false
@@ -704,6 +705,8 @@ inject_heartbeats() {
 }
 
 # Run optional external verification command after a successful phase.
+# Captures stdout/stderr into per-phase verification log files so they can be
+# appended to the main phase log in a machine-readable way.
 # Returns:
 #   0 - verification passed or disabled/dry-run
 #   1 - verification/gate failure (exit 1)
@@ -722,16 +725,30 @@ run_verification_command() {
     return 0
   fi
 
-  local _pv title rc
+  local _pv title rc verify_out verify_err
   _pv=$(phase_to_var "$phase_num")
   title=$(eval "echo \"\$PHASE_TITLE_${_pv}\"")
 
   log_verbose "run_verification_command: phase=$phase_num title=$title cmd=$VERIFY_COMMAND"
 
+  mkdir -p ".claudeloop/logs"
+  verify_out=".claudeloop/logs/phase-${phase_num}.verify.out"
+  verify_err=".claudeloop/logs/phase-${phase_num}.verify.err"
+  : > "$verify_out"
+  : > "$verify_err"
+
   CLAUDELOOP_PHASE_NUM="$phase_num" \
   CLAUDELOOP_PHASE_TITLE="$title" \
-  sh -c "$VERIFY_COMMAND"
+  sh -c "$VERIFY_COMMAND" >"$verify_out" 2>"$verify_err"
   rc=$?
+
+  # Replay verification output to the user while keeping a copy for the phase log
+  if [ -s "$verify_out" ]; then
+    cat "$verify_out"
+  fi
+  if [ -s "$verify_err" ]; then
+    cat "$verify_err" >&2
+  fi
 
   case "$rc" in
     0)
@@ -751,6 +768,72 @@ run_verification_command() {
       return 3
       ;;
   esac
+}
+
+# Append captured verification output into the main phase log (if any).
+# Args: $1 - phase number, $2 - phase log file path, $3 - verification exit code
+append_verification_log_section() {
+  local phase_num="$1"
+  local log_file="$2"
+  local verify_rc="$3"
+  local verify_out=".claudeloop/logs/phase-${phase_num}.verify.out"
+  local verify_err=".claudeloop/logs/phase-${phase_num}.verify.err"
+
+  # Nothing to append if both files are empty or missing
+  if [ ! -s "$verify_out" ] && [ ! -s "$verify_err" ]; then
+    return 0
+  fi
+
+  {
+    printf '\n=== VERIFICATION START phase=%s exit_code=%s time=%s ===\n' \
+      "$phase_num" "$verify_rc" "$(date '+%Y-%m-%dT%H:%M:%S')"
+    if [ -s "$verify_out" ]; then
+      printf '--- verification stdout ---\n'
+      cat "$verify_out"
+      printf '\n'
+    fi
+    if [ -s "$verify_err" ]; then
+      printf '--- verification stderr ---\n'
+      cat "$verify_err"
+      printf '\n'
+    fi
+    printf '=== VERIFICATION END phase=%s ===\n' "$phase_num"
+  } >> "$log_file" 2>/dev/null || true
+
+  rm -f "$verify_out" "$verify_err"
+}
+
+# Extract the tail of the last verification section from an archived phase log.
+# Args: $1 - archived phase log path, $2 - max lines to return
+extract_verification_context() {
+  local log_file="$1"
+  local max_lines="$2"
+
+  [ -f "$log_file" ] || return 0
+
+  awk '
+    /^=== VERIFICATION START / {
+      in_block = 1
+      start = NR
+    }
+    /^=== VERIFICATION END / {
+      if (in_block) {
+        in_block = 0
+        last_start = start
+        last_end = NR
+      }
+    }
+    {
+      lines[NR] = $0
+    }
+    END {
+      if (last_start && last_end) {
+        for (i = last_start; i <= last_end; i++) {
+          print lines[i]
+        }
+      }
+    }
+  ' "$log_file" 2>/dev/null | tail -n "${max_lines:-40}"
 }
 
 # Execute a single phase
@@ -841,6 +924,23 @@ ${_prev_context}
 
 Learn from the above. Do not repeat the same mistakes. Address any errors shown before proceeding.
 You MUST still complete every subtask listed in the phase description — do not skip steps because prior work exists."
+    fi
+
+    # Extract tail of the last verification section from the previous attempt log (if any)
+    local _prev_verify_context
+    _prev_verify_context=$(extract_verification_context "$_prev_attempt_log" "$VERIFY_CONTEXT_TAIL_LINES")
+
+    if [ -n "$_prev_verify_context" ]; then
+      prompt="${prompt}
+
+## Previous Attempt Verification Output
+
+The previous attempt failed in the verification step (e.g. tests or gates). Here is the tail of the verifier output:
+
+\`\`\`
+${_prev_verify_context}
+\`\`\`
+"
     fi
   fi
 
@@ -975,6 +1075,7 @@ You MUST still complete every subtask listed in the phase description — do not
     # Optional external verification hook (e.g. gate) after successful phase
     local _verify_rc=0
     run_verification_command "$phase_num" || _verify_rc=$?
+    append_verification_log_section "$phase_num" "$log_file" "$_verify_rc"
 
     case "$_verify_rc" in
       0)
@@ -1012,6 +1113,7 @@ You MUST still complete every subtask listed in the phase description — do not
       # Optional external verification hook after successful session
       local _verify_rc2=0
       run_verification_command "$phase_num" || _verify_rc2=$?
+      append_verification_log_section "$phase_num" "$log_file" "$_verify_rc2"
 
       case "$_verify_rc2" in
         0)
